@@ -1,30 +1,22 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const mysql = require('mysql');
+const mysql = require('mysql2/promise');
 const app = express();
 const port = 8888;
-
 const amountLimit = 1000;
-
-const db = mysql.createConnection({
+const maxRetries = 3;
+const dbConfig = {
   host: 'localhost',
   user: 'root',
   password: '',
   database: 'codetest'
-});
-
-db.connect(err => {
-  if (err) {
-    console.error('Error connecting to the database:', err);
-    process.exit(1);
-  }
-  console.log('Connected to the database');
-});
+};
 
 app.use(bodyParser.json());
 
-app.post('/transactions', (req, res) => {
+app.post('/transactions', async (req, res) => {
   const { user_id, amount, description } = req.body;
+  console.log('🚀 ~ app.post ~ user_id, amount, description:', user_id, amount, description);
   const apiKey = req.headers['apikey'];
 
   if (!user_id || !amount || !description || !apiKey) {
@@ -35,25 +27,52 @@ app.post('/transactions', (req, res) => {
     return res.status(403).json({ error: 'Invalid API key' });
   }
 
-  db.query('SELECT SUM(amount) AS totalAmount FROM transactions WHERE user_id = ?', [user_id], (err, results) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+  let retries = 0;
+  while (retries < maxRetries) {
+    const connection = await mysql.createConnection(dbConfig);
+    await connection.beginTransaction();
 
-    const totalAmount = results[0].totalAmount || 0;
+    try {
+      // Check the current total amount for the user
+      const [results] = await connection.execute(
+        'SELECT SUM(amount) AS totalAmount FROM transactions WHERE user_id = ? lock in share mode',
+        [user_id]
+      );
+      const totalAmount = results[0].totalAmount || 0;
 
-    if (totalAmount + amount > amountLimit) {
-      return res.status(402).json({ error: 'Amount limit exceeded' });
-    }
+      // If the new total amount exceeds the limit, rollback and return an error
+      if (parseInt(totalAmount, 10) + parseInt(amount, 10) > amountLimit) {
+        console.log('🚀 ~ app.post ~ totalAmount + amount > amountLimit:', totalAmount + amount > amountLimit);
+        await connection.rollback();
+        return res.status(402).json({ error: 'Amount limit exceeded' });
+      }
 
-    const transaction = { user_id, amount, description };
-    db.query('INSERT INTO transactions SET ?', transaction, (err, result) => {
-      if (err) {
+      // Insert the new transaction
+      const [result] = await connection.execute(
+        'INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)',
+        [user_id, amount, description]
+      );
+      await connection.commit();
+      return res.status(201).json({ message: 'Transaction created', transactionId: result.insertId });
+    } catch (err) {
+      if (err.code === 'ER_LOCK_DEADLOCK') {
+        retries += 1;
+        console.log(`Deadlock detected, retrying transaction (${retries}/${maxRetries})`);
+        await connection.rollback();
+        await connection.end();
+        continue;
+      } else {
+        console.log('🚀 ~ app.post ~ err:', err);
+        await connection.rollback();
+        await connection.end();
         return res.status(500).json({ error: 'Database error' });
       }
-      res.status(201).json({ message: 'Transaction created', transactionId: result.insertId });
-    });
-  });
+    } finally {
+      await connection.end();
+    }
+  }
+
+  return res.status(402).json({ error: 'Transaction failed after multiple retries due to deadlock' });
 });
 
 app.listen(port, () => {
