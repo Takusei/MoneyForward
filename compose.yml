@@ -9,9 +9,17 @@ services:
     ports:
       - 3306:3306
     hostname: db
+    networks:
+      - app-network
 
-  # app:
-  #   build:
-  #     context: app
-  #   ports:
-  #     - 8888:8888
+  app:
+    build:
+      context: app
+    ports:
+      - 8888:8888
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
